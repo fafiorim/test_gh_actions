@@ -1,0 +1,249 @@
+name: On Pull Request
+
+run-name: On Pull Request
+
+on: [pull_request, workflow_dispatch]
+
+env:
+  CONTAINER_IMAGE_NAME: "application"
+
+jobs:
+  scan-repository-for-malware:
+    name: Scan Repository for Malware
+    runs-on: ubuntu-latest
+    steps:
+      - 
+        uses: actions/checkout@v3
+      -
+        name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+      - 
+        name: Install Scanner
+        run: python3 -m pip install cloudone-vsapi
+      - 
+        name: Scan Repository for Malware
+        run: python3 .github/scripts/am-scanner.py -f $(find . -type f -not -path "./.git/*" | tr '\n' ' ') --addr antimalware.us-1.cloudone.trendmicro.com:443 --api_key ${{ secrets.CLOUD_ONE_API_KEY }} > /tmp/result.json && cat /tmp/result.json
+      -
+        name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: Repository Malware Scan Result
+          path: /tmp/result.json
+          retention-days: 1
+      -
+        name: Generate Timestamp
+        run: echo "TIME=$(date +%F-%T)" >> $GITHUB_ENV
+      -
+        name: Configure AWS credentials from Test account
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY}}
+          aws-region: us-east-1
+      -
+        name: Upload artifact to S3
+        run: aws s3 cp /tmp/result.json s3://${{ vars.ARTIFACTS_BUCKET }}/malware/result-${{ env.TIME }}.json
+      -
+        name: Analyze Scan Result
+        run: |
+          if [[  $(jq '.[] | select (.scanResult != 0)' result.json ) ]]; then
+            echo "Malware found in repository"
+            exit 1
+          else
+            echo "No malware found in repository"
+          fi
+
+  build-container-image:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    needs: scan-repository-for-malware
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      -
+        name: Build and export
+        uses: docker/build-push-action@v4
+        with:
+          context: app/
+          tags: ${{ env.CONTAINER_IMAGE_NAME }}:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/${{ env.CONTAINER_IMAGE_NAME }}.${{ github.sha }}.tar
+      -
+        name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: Container Image Tarball
+          path: /tmp/${{ env.CONTAINER_IMAGE_NAME }}.${{ github.sha }}.tar
+          retention-days: 1
+  
+  scan-container-image-for-vulnerabilities:
+    name: Scan Container Image for Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: build-container-image
+    steps:
+      -
+        name: Download image tarball artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: Container Image Tarball
+      - 
+        uses: trendmicro/cloudone-container-security-github-action@main
+        with:
+            CLOUD_ONE_API_KEY: ${{ secrets.CLOUD_ONE_API_KEY }}
+            REGION: us-1
+            SCAN_RESULT_ARTIFACT: result.json
+            LOCAL_IMAGE_TARBALL: ${{ env.CONTAINER_IMAGE_NAME }}.${{ github.sha }}.tar
+            # Result will be considered a failure if any of the following thresholds are exceeded
+            MAX_TOTAL: 100
+            MAX_CRITICAL: 100
+            MAX_HIGH: 100
+            MAX_MEDIUM: 100
+            MAX_LOW: 100
+            MAX_NEGLIGIBLE: 100
+            MAX_UNKNOWN: 100
+      -
+        name: Generate Timestamp
+        run: echo "TIME=$(date +%F-%T)" >> $GITHUB_ENV
+      -
+        name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: Container Image Vulnerability Scan Result
+          path: result.json
+          retention-days: 1
+      -
+        name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: Container Image SBOM
+          path: SBOM.json
+      -
+        name: Configure AWS credentials from Test account
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY}}
+          aws-region: us-east-1
+      -
+        name: Upload artifact to S3
+        run: |
+          aws s3 cp result.json s3://${{ vars.ARTIFACTS_BUCKET }}/container-image-vulnerabilities/result-${{ env.TIME }}.json
+          aws s3 cp SBOM.json s3://${{ vars.ARTIFACTS_BUCKET }}/iac/SBOM-${{ env.TIME }}.json
+
+  scan-container-image-for-malware:
+    name: Scan Container Image for Malware
+    runs-on: ubuntu-latest
+    needs: scan-container-image-for-vulnerabilities
+    steps:
+      -
+        name: Scan Repository for Malware
+        run: |
+          echo "Malware scan is disabled"
+          exit 0
+      # - 
+      #   uses: actions/checkout@v3
+      # -
+      #   name: Set up Python 3.10
+      #   uses: actions/setup-python@v4
+      #   with:
+      #     python-version: "3.10"
+      # - 
+      #   name: Install Scanner
+      #   run: python3 -m pip install cloudone-vsapi
+      # -
+      #   name: Download image tarball artifact
+      #   uses: actions/download-artifact@v3
+      #   with:
+      #     name: Container Image Tarball
+      #     path: /tmp
+      # - name: test
+      #   run: ls -lah . && ls -lah /tmp
+      # - 
+      #   name: Extract container image tarball
+      #   run: .github/scripts/./extract-all-layers.sh /tmp/${{ env.CONTAINER_IMAGE_NAME }}.${{ github.sha }}.tar /tmp/image
+      # - 
+      #   name: Scan Layers for Malware
+      #   run: python3 .github/scripts/am-scanner.py -f $(find /tmp/image -type f -not -path "./.git/*" | tr '\n' ' ') -a antimalware.us-1.cloudone.trendmicro.com:443 --api_key ${{ secrets.CLOUD_ONE_API_KEY }} > /tmp/result.json && cat /tmp/result.json
+      # -
+      #   name: Generate Timestamp
+      #   run: echo "TIME=$(date +%F-%T)" >> $GITHUB_ENV
+      # -
+      #   name: Upload artifact to GitHub
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: Container Image Malware Scan Result
+      #     path: /tmp/result.json
+      #     retention-days: 1
+      # -
+      #   name: Configure AWS credentials from Test account
+      #   uses: aws-actions/configure-aws-credentials@v2
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY}}
+      #     aws-region: us-east-1
+      # -
+      #   name: Upload artifact to S3
+      #   run: aws s3 cp /tmp/result.json s3://${{ vars.ARTIFACTS_BUCKET }}/container-image-malware/result-${{ env.TIME }}.json
+      -
+        name: Delete Image Tarball Artifact
+        uses: geekyeggo/delete-artifact@v2
+        if: always()
+        with:
+          name: Container Image Tarball
+  
+  scan-iac-template:
+    name: Scan IaC Template for Misconfigurations
+    runs-on: ubuntu-latest
+    needs: scan-repository-for-malware
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        run: echo "Scan IaC Template for Misconfigurations"
+      -
+        name: Cloud One Conformity Pipeline Scanner
+        uses: raphabot/conformity-template-scanner-pipeline@v1.0.3
+        env:
+          cc_apikey: ${{ secrets.CLOUD_ONE_API_KEY }}
+          maxExtreme: 0
+          maxVeryHigh: 0
+          maxHigh: 2
+          maxMedium: 20
+          maxLow: 20
+          cc_region: us-west-2
+          templatePath: iac/template.yaml
+          cc_output_results: true
+      -
+        name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: IaC Misconfigurations Scan Result
+          path: results.json
+      -
+        name: Generate Timestamp
+        run: echo "TIME=$(date +%F-%T)" >> $GITHUB_ENV
+      -
+        name: Configure AWS credentials from Test account
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY}}
+          aws-region: us-east-1
+      -
+        name: Upload artifact to S3
+        run: aws s3 cp results.json s3://${{ vars.ARTIFACTS_BUCKET }}/iac/result-${{ env.TIME }}.json
+  
+  notify-pr-ready-for-review:
+    name: Notify PR Ready for Review 
+    runs-on: ubuntu-latest
+    needs:
+      - scan-iac-template
+      - scan-container-image-for-malware
+    steps:
+      - run: echo "Notify PR Ready for Review"
